@@ -1,6 +1,7 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 from streamlit_js_eval import streamlit_js_eval
 from streamlit_autorefresh import st_autorefresh
 
@@ -12,113 +13,94 @@ st_autorefresh(interval=REFRESH_SECS * 1000, limit=None, key="autorefresh")
 
 # ── Veritabanı ──────────────────────────────────────────────────────────────
 
+@st.cache_resource
 def get_conn():
-    return sqlite3.connect('playlist.db', check_same_thread=False)
+    """Supabase PostgreSQL bağlantısı — uygulama boyunca tekrar kullanılır."""
+    return psycopg2.connect(st.secrets["DATABASE_URL"], sslmode="require")
+
+def run_query(sql, params=None, fetch=False):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params or ())
+            if fetch:
+                return cur.fetchall()
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 def init_db():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute('''
+    run_query("""
         CREATE TABLE IF NOT EXISTS songs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             title TEXT NOT NULL,
             artist TEXT,
             added_by TEXT NOT NULL,
             likes INTEGER DEFAULT 0,
             dislikes INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'approved'
+            status TEXT DEFAULT 'pending'
         )
-    ''')
-    # Mevcut DB'de status kolonu yoksa ekle, var olanları 'approved' yap
-    try:
-        c.execute("ALTER TABLE songs ADD COLUMN status TEXT DEFAULT 'approved'")
-        c.execute("UPDATE songs SET status = 'approved' WHERE status IS NULL")
-    except sqlite3.OperationalError:
-        pass  # Kolon zaten var
-
-    c.execute('''
+    """)
+    run_query("""
         CREATE TABLE IF NOT EXISTS votes (
             device_id TEXT NOT NULL,
             song_id INTEGER NOT NULL,
             vote_type TEXT NOT NULL,
             PRIMARY KEY (device_id, song_id)
         )
-    ''')
-    conn.commit()
-    conn.close()
+    """)
 
 def get_songs():
-    """Sadece admin onaylı şarkıları döndürür."""
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM songs WHERE status = 'approved'", conn)
-    conn.close()
+    rows = run_query(
+        "SELECT * FROM songs WHERE status = 'approved' ORDER BY (likes - dislikes) DESC",
+        fetch=True
+    )
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
     if not df.empty:
         df['score'] = df['likes'] - df['dislikes']
-        df = df.sort_values(by='score', ascending=False).reset_index(drop=True)
     return df
 
 def get_pending_songs():
-    """Admin onayı bekleyen şarkıları döndürür."""
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM songs WHERE status = 'pending'", conn)
-    conn.close()
-    return df
+    rows = run_query(
+        "SELECT * FROM songs WHERE status = 'pending' ORDER BY id",
+        fetch=True
+    )
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 def get_device_votes(device_id: str) -> dict:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute('SELECT song_id, vote_type FROM votes WHERE device_id = ?', (device_id,))
-    rows = c.fetchall()
-    conn.close()
-    return {str(r[0]): r[1] for r in rows}
+    rows = run_query(
+        "SELECT song_id, vote_type FROM votes WHERE device_id = %s",
+        (device_id,), fetch=True
+    )
+    return {str(r['song_id']): r['vote_type'] for r in rows} if rows else {}
 
 def record_vote(device_id: str, song_id: int, vote_type: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute('SELECT 1 FROM votes WHERE device_id=? AND song_id=?', (device_id, song_id))
-    if c.fetchone():
-        conn.close()
-        return
-    c.execute('INSERT INTO votes (device_id, song_id, vote_type) VALUES (?,?,?)',
-              (device_id, song_id, vote_type))
+    # Çift oy DB kısıtıyla engellenmiş, INSERT OR IGNORE yerine ON CONFLICT DO NOTHING
+    run_query(
+        "INSERT INTO votes (device_id, song_id, vote_type) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+        (device_id, song_id, vote_type)
+    )
     if vote_type == 'like':
-        c.execute('UPDATE songs SET likes = likes + 1 WHERE id = ?', (song_id,))
+        run_query("UPDATE songs SET likes = likes + 1 WHERE id = %s", (song_id,))
     else:
-        c.execute('UPDATE songs SET dislikes = dislikes + 1 WHERE id = ?', (song_id,))
-    conn.commit()
-    conn.close()
+        run_query("UPDATE songs SET dislikes = dislikes + 1 WHERE id = %s", (song_id,))
 
 def add_song(title, artist, added_by):
-    """Yeni öneriyi 'pending' statüsüyle ekler."""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO songs (title, artist, added_by, status) VALUES (?, ?, ?, 'pending')",
-              (title, artist, added_by))
-    conn.commit()
-    conn.close()
+    run_query(
+        "INSERT INTO songs (title, artist, added_by, status) VALUES (%s, %s, %s, 'pending')",
+        (title, artist, added_by)
+    )
 
 def approve_song(song_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE songs SET status = 'approved' WHERE id = ?", (song_id,))
-    conn.commit()
-    conn.close()
+    run_query("UPDATE songs SET status = 'approved' WHERE id = %s", (song_id,))
 
 def reject_song(song_id: int):
-    """Reddedilen öneriyi tamamen siler."""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM songs WHERE id = ?", (song_id,))
-    conn.commit()
-    conn.close()
+    run_query("DELETE FROM songs WHERE id = %s", (song_id,))
 
 def delete_song(song_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute('DELETE FROM songs WHERE id = ?', (song_id,))
-    c.execute('DELETE FROM votes WHERE song_id = ?', (song_id,))
-    conn.commit()
-    conn.close()
+    run_query("DELETE FROM votes WHERE song_id = %s", (song_id,))
+    run_query("DELETE FROM songs WHERE id = %s", (song_id,))
 
 # ── CSS ─────────────────────────────────────────────────────────────────────
 
@@ -191,7 +173,7 @@ Listeyi oylayarak sıralamayı belirleyin, ya da yeni şarkı önerin! &nbsp;
     var secs = {REFRESH_SECS};
     var el = document.getElementById('countdown');
     if (!el) return;
-    var iv = setInterval(function(){{
+    setInterval(function(){{
         secs--;
         if (secs <= 0) {{ secs = {REFRESH_SECS}; }}
         if (el) el.innerText = '(' + secs + 's)';
@@ -210,11 +192,10 @@ if df.empty:
 else:
     for _, row in df.iterrows():
         song_id = str(int(row['id']))
+        vote_val = device_votes.get(song_id)
+        is_voted = vote_val is not None
 
         col_info, col_like, col_dislike = st.columns([4, 1, 1], vertical_alignment="center")
-
-        vote_val   = device_votes.get(song_id)
-        is_voted   = vote_val is not None
 
         with col_info:
             artist_text = f" - {row['artist']}" if row['artist'] else ""
