@@ -16,7 +16,11 @@ st_autorefresh(interval=REFRESH_SECS * 1000, limit=None, key="autorefresh")
 @st.cache_resource
 def get_conn():
     """Supabase PostgreSQL bağlantısı — uygulama boyunca tekrar kullanılır."""
-    return psycopg2.connect(st.secrets["DATABASE_URL"], sslmode="require")
+    url = st.secrets["DATABASE_URL"]
+    # sslmode URL'de yoksa ekle
+    if "sslmode" not in url:
+        url += "?sslmode=require"
+    return psycopg2.connect(url, connect_timeout=10)
 
 def run_query(sql, params=None, fetch=False):
     conn = get_conn()
@@ -50,6 +54,27 @@ def init_db():
             PRIMARY KEY (device_id, song_id)
         )
     """)
+    run_query("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    # Varsayılan: onay gerekli (auto_approve = false)
+    run_query("""
+        INSERT INTO settings (key, value) VALUES ('auto_approve', 'false')
+        ON CONFLICT (key) DO NOTHING
+    """)
+
+def get_setting(key: str) -> str:
+    rows = run_query("SELECT value FROM settings WHERE key = %s", (key,), fetch=True)
+    return rows[0]['value'] if rows else None
+
+def set_setting(key: str, value: str):
+    run_query("""
+        INSERT INTO settings (key, value) VALUES (%s, %s)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """, (key, value))
 
 def get_songs():
     rows = run_query(
@@ -87,10 +112,13 @@ def record_vote(device_id: str, song_id: int, vote_type: str):
         run_query("UPDATE songs SET dislikes = dislikes + 1 WHERE id = %s", (song_id,))
 
 def add_song(title, artist, added_by):
+    auto_approve = get_setting('auto_approve') == 'true'
+    status = 'approved' if auto_approve else 'pending'
     run_query(
-        "INSERT INTO songs (title, artist, added_by, status) VALUES (%s, %s, %s, 'pending')",
-        (title, artist, added_by)
+        "INSERT INTO songs (title, artist, added_by, status) VALUES (%s, %s, %s, %s)",
+        (title, artist, added_by, status)
     )
+    return status
 
 def approve_song(song_id: int):
     run_query("UPDATE songs SET status = 'approved' WHERE id = %s", (song_id,))
@@ -232,8 +260,12 @@ with st.form("add_song_form", clear_on_submit=True):
         if not new_title.strip() or not new_added_by.strip():
             st.error("Lütfen 'Şarkı Adı' ve 'Öneren Kişi' alanlarını doldurun.")
         else:
-            add_song(new_title.strip(), new_artist.strip(), new_added_by.strip())
-            st.success(f"'{new_title}' önerildi! Admin onayından sonra listede görünecek.")
+            status = add_song(new_title.strip(), new_artist.strip(), new_added_by.strip())
+            if status == 'approved':
+                st.success(f"'{new_title}' listeye eklendi!")
+                st.rerun()
+            else:
+                st.success(f"'{new_title}' önerildi! Admin onayından sonra listede görünecek.")
 
 # ── Admin Paneli ─────────────────────────────────────────────────────────────
 
@@ -255,6 +287,23 @@ with st.expander("Admin Paneli"):
     else:
         st.success("Admin olarak giriş yapıldı.")
 
+        # ── Otomatik Onay Modu ──
+        auto_approve_current = get_setting('auto_approve') == 'true'
+        st.subheader("⚙️ Ayarlar")
+        new_val = st.toggle(
+            "Otomatik Onay Modu",
+            value=auto_approve_current,
+            help="Açıkken gelen öneriler doğrudan listeye eklenir. Kapalıyken admin onayı beklenir."
+        )
+        if new_val != auto_approve_current:
+            set_setting('auto_approve', 'true' if new_val else 'false')
+            st.rerun()
+        if auto_approve_current:
+            st.caption("🟢 Şu an: Öneriler otomatik onaylanıyor")
+        else:
+            st.caption("🟡 Şu an: Öneriler admin onayı bekliyor")
+
+        st.divider()
         # ── Bekleyen Öneriler ──
         pending_df = get_pending_songs()
         if not pending_df.empty:
