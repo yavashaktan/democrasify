@@ -20,10 +20,17 @@ def init_db():
             artist TEXT,
             added_by TEXT NOT NULL,
             likes INTEGER DEFAULT 0,
-            dislikes INTEGER DEFAULT 0
+            dislikes INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'approved'
         )
     ''')
-    # Her cihazın hangi şarkıya ne oyladığını tutan tablo
+    # Mevcut DB'de status kolonu yoksa ekle, var olanları 'approved' yap
+    try:
+        c.execute("ALTER TABLE songs ADD COLUMN status TEXT DEFAULT 'approved'")
+        c.execute("UPDATE songs SET status = 'approved' WHERE status IS NULL")
+    except sqlite3.OperationalError:
+        pass  # Kolon zaten var
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS votes (
             device_id TEXT NOT NULL,
@@ -36,16 +43,23 @@ def init_db():
     conn.close()
 
 def get_songs():
+    """Sadece admin onaylı şarkıları döndürür."""
     conn = get_conn()
-    df = pd.read_sql_query('SELECT * FROM songs', conn)
+    df = pd.read_sql_query("SELECT * FROM songs WHERE status = 'approved'", conn)
     conn.close()
     if not df.empty:
         df['score'] = df['likes'] - df['dislikes']
         df = df.sort_values(by='score', ascending=False).reset_index(drop=True)
     return df
 
+def get_pending_songs():
+    """Admin onayı bekleyen şarkıları döndürür."""
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT * FROM songs WHERE status = 'pending'", conn)
+    conn.close()
+    return df
+
 def get_device_votes(device_id: str) -> dict:
-    """Bu cihazın hangi şarkıya ne oyladığını döndürür: {song_id: vote_type}"""
     conn = get_conn()
     c = conn.cursor()
     c.execute('SELECT song_id, vote_type FROM votes WHERE device_id = ?', (device_id,))
@@ -56,11 +70,10 @@ def get_device_votes(device_id: str) -> dict:
 def record_vote(device_id: str, song_id: int, vote_type: str):
     conn = get_conn()
     c = conn.cursor()
-    # Çift oy verilmesini DB seviyesinde de engelleyin
     c.execute('SELECT 1 FROM votes WHERE device_id=? AND song_id=?', (device_id, song_id))
     if c.fetchone():
         conn.close()
-        return  # Zaten oy verilmiş, işlemi yoksay
+        return
     c.execute('INSERT INTO votes (device_id, song_id, vote_type) VALUES (?,?,?)',
               (device_id, song_id, vote_type))
     if vote_type == 'like':
@@ -71,14 +84,30 @@ def record_vote(device_id: str, song_id: int, vote_type: str):
     conn.close()
 
 def add_song(title, artist, added_by):
+    """Yeni öneriyi 'pending' statüsüyle ekler."""
     conn = get_conn()
     c = conn.cursor()
-    c.execute('INSERT INTO songs (title, artist, added_by) VALUES (?, ?, ?)',
+    c.execute("INSERT INTO songs (title, artist, added_by, status) VALUES (?, ?, ?, 'pending')",
               (title, artist, added_by))
     conn.commit()
     conn.close()
 
-def delete_song(song_id):
+def approve_song(song_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE songs SET status = 'approved' WHERE id = ?", (song_id,))
+    conn.commit()
+    conn.close()
+
+def reject_song(song_id: int):
+    """Reddedilen öneriyi tamamen siler."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM songs WHERE id = ?", (song_id,))
+    conn.commit()
+    conn.close()
+
+def delete_song(song_id: int):
     conn = get_conn()
     c = conn.cursor()
     c.execute('DELETE FROM songs WHERE id = ?', (song_id,))
@@ -118,13 +147,11 @@ st.markdown("""
 
 init_db()
 
-# Session state
 if 'fail_count' not in st.session_state:
     st.session_state.fail_count = 0
 if 'admin_logged' not in st.session_state:
     st.session_state.admin_logged = False
 
-# Cihaza özgü kalıcı ID → localStorage'dan oku, yoksa oluştur
 device_id = streamlit_js_eval(
     js_expressions="""(function(){
         var id = localStorage.getItem('democrasify_device_id');
@@ -137,15 +164,13 @@ device_id = streamlit_js_eval(
     key="device_id_fetch"
 )
 
-# device_id ilk render'da None gelebilir (JS henüz çalışmadı), bekle
 if not device_id:
     st.info("Yükleniyor...")
     st.stop()
 
-# Bu cihazın oy geçmişini DB'den çek
 device_votes = get_device_votes(device_id)
 
-# ── Admin kilidi ─────────────────────────────────────────────────────────────
+# ── Başlık & Engel Kontrolü ──────────────────────────────────────────────────
 
 st.title("🎵 Yolculuk Playlisti")
 
@@ -156,20 +181,20 @@ if st.session_state.fail_count >= 3:
 st.write("Listeyi oylayarak sıralamayı belirleyin, ya da yeni şarkı önerin!")
 st.divider()
 
-# ── Liste ────────────────────────────────────────────────────────────────────
+# ── Playlist ─────────────────────────────────────────────────────────────────
 
 df = get_songs()
 
 if df.empty:
-    st.info("Henüz şarkı eklenmemiş. Aşağıdan ekleyebilirsin!")
+    st.info("Henüz onaylanmış şarkı yok. Aşağıdan öneri gönderebilirsin!")
 else:
     for _, row in df.iterrows():
         song_id = str(int(row['id']))
 
         col_info, col_like, col_dislike = st.columns([4, 1, 1], vertical_alignment="center")
 
-        vote_val = device_votes.get(song_id)
-        is_voted = vote_val is not None
+        vote_val   = device_votes.get(song_id)
+        is_voted   = vote_val is not None
 
         with col_info:
             artist_text = f" - {row['artist']}" if row['artist'] else ""
@@ -177,14 +202,14 @@ else:
             st.caption(f"Öneren: {row['added_by']} | Skor: **{int(row['score'])}**")
 
         with col_like:
-            label = "✅ 👍" if vote_val == "like" else "👍"
+            label    = "✅ 👍" if vote_val == "like" else "👍"
             btn_type = "primary" if vote_val == "like" else "secondary"
             if st.button(label, key=f"like_{song_id}", disabled=is_voted, type=btn_type):
                 record_vote(device_id, int(row['id']), 'like')
                 st.rerun()
 
         with col_dislike:
-            label = "✅ 👎" if vote_val == "dislike" else "👎"
+            label    = "✅ 👎" if vote_val == "dislike" else "👎"
             btn_type = "primary" if vote_val == "dislike" else "secondary"
             if st.button(label, key=f"dislike_{song_id}", disabled=is_voted, type=btn_type):
                 record_vote(device_id, int(row['id']), 'dislike')
@@ -192,23 +217,22 @@ else:
 
         st.write("---")
 
-# ── Şarkı Ekleme ─────────────────────────────────────────────────────────────
+# ── Şarkı Öneri Formu ────────────────────────────────────────────────────────
 
 st.divider()
-st.subheader("➕ Yeni Şarkı Öner")
+st.subheader("➕ Şarkı Öner")
 with st.form("add_song_form", clear_on_submit=True):
-    new_title = st.text_input("Şarkı Adı *", max_chars=100)
-    new_artist = st.text_input("Şarkıcı / Grup", max_chars=100)
+    new_title    = st.text_input("Şarkı Adı *", max_chars=100)
+    new_artist   = st.text_input("Şarkıcı / Grup", max_chars=100)
     new_added_by = st.text_input("Öneren Kişi (Adınız) *", max_chars=50)
 
-    submitted = st.form_submit_button("Listeye Ekle")
+    submitted = st.form_submit_button("Gönder")
     if submitted:
         if not new_title.strip() or not new_added_by.strip():
             st.error("Lütfen 'Şarkı Adı' ve 'Öneren Kişi' alanlarını doldurun.")
         else:
             add_song(new_title.strip(), new_artist.strip(), new_added_by.strip())
-            st.success(f"'{new_title}' başarıyla eklendi!")
-            st.rerun()
+            st.success(f"'{new_title}' önerildi! Admin onayından sonra listede görünecek.")
 
 # ── Admin Paneli ─────────────────────────────────────────────────────────────
 
@@ -219,7 +243,7 @@ with st.expander("Admin Paneli"):
         if st.button("Giriş Yap"):
             if admin_pw == st.secrets["ADMIN_PASSWORD"]:
                 st.session_state.admin_logged = True
-                st.session_state.fail_count = 0
+                st.session_state.fail_count   = 0
                 st.rerun()
             else:
                 st.session_state.fail_count += 1
@@ -229,7 +253,33 @@ with st.expander("Admin Paneli"):
                     st.warning("Denemeyi bırak!")
     else:
         st.success("Admin olarak giriş yapıldı.")
+
+        # ── Bekleyen Öneriler ──
+        pending_df = get_pending_songs()
+        if not pending_df.empty:
+            st.subheader(f"⏳ Bekleyen Öneriler ({len(pending_df)})")
+            for _, p_row in pending_df.iterrows():
+                p_id = int(p_row['id'])
+                artist_text = f" — {p_row['artist']}" if p_row['artist'] else ""
+                col_t, col_a, col_r = st.columns([4, 1, 1])
+                with col_t:
+                    st.markdown(f"**{p_row['title']}**{artist_text}")
+                    st.caption(f"Öneren: {p_row['added_by']}")
+                with col_a:
+                    if st.button("✅", key=f"approve_{p_id}", help="Onayla"):
+                        approve_song(p_id)
+                        st.rerun()
+                with col_r:
+                    if st.button("❌", key=f"reject_{p_id}", help="Reddet"):
+                        reject_song(p_id)
+                        st.rerun()
+                st.write("---")
+        else:
+            st.info("Bekleyen öneri yok.")
+
+        # ── Şarkı Silme ──
         if not df.empty:
+            st.subheader("🗑️ Şarkı Sil")
             song_to_delete = st.selectbox(
                 "Silinecek şarkıyı seçin:",
                 df['id'].astype(int).astype(str) + " - " + df['title']
@@ -239,6 +289,7 @@ with st.expander("Admin Paneli"):
                 delete_song(del_id)
                 st.success("Şarkı silindi.")
                 st.rerun()
+
         if st.button("Çıkış Yap"):
             st.session_state.admin_logged = False
             st.rerun()
