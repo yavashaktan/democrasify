@@ -2,8 +2,13 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from streamlit_js_eval import streamlit_js_eval
+from streamlit_autorefresh import st_autorefresh
+
+REFRESH_SECS = 30  # Kaç saniyede bir yenilensin?
 
 st.set_page_config(page_title="Demokrasify - Ortak Playlist", page_icon="🎵", layout="centered")
+
+st_autorefresh(interval=REFRESH_SECS * 1000, limit=None, key="autorefresh")
 
 # ── Veritabanı ──────────────────────────────────────────────────────────────
 
@@ -178,7 +183,22 @@ if st.session_state.fail_count >= 3:
     st.error("Çok fazla hatalı giriş denemesi. Sisteme erişiminiz engellendi.")
     st.stop()
 
-st.write("Listeyi oylayarak sıralamayı belirleyin, ya da yeni şarkı önerin!")
+st.markdown(f"""
+Listeyi oylayarak sıralamayı belirleyin, ya da yeni şarkı önerin! &nbsp;
+<span id="countdown" style="color:#888;font-size:0.85em;">({REFRESH_SECS}s)</span>
+<script>
+(function(){{
+    var secs = {REFRESH_SECS};
+    var el = document.getElementById('countdown');
+    if (!el) return;
+    var iv = setInterval(function(){{
+        secs--;
+        if (secs <= 0) {{ secs = {REFRESH_SECS}; }}
+        if (el) el.innerText = '(' + secs + 's)';
+    }}, 1000);
+}})();
+</script>
+""", unsafe_allow_html=True)
 st.divider()
 
 # ── Playlist ─────────────────────────────────────────────────────────────────
